@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Voicebot — Assistant Virtuel</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        font-family: 'Segoe UI', system-ui, sans-serif;
+        background: #0f1117;
+        color: #e2e8f0;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+      }
+
+      .card {
+        background: #1a1d2e;
+        border: 1px solid #2d3148;
+        border-radius: 16px;
+        padding: 36px;
+        width: 100%;
+        max-width: 560px;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+      }
+
+      .header {
+        text-align: center;
+        margin-bottom: 32px;
+      }
+
+      .header h1 {
+        font-size: 1.5rem;
+        font-weight: 600;
+        color: #e2e8f0;
+      }
+
+      .header p {
+        color: #64748b;
+        font-size: 0.875rem;
+        margin-top: 4px;
+      }
+
+      /* ── Orb microphone ── */
+      .orb-wrapper {
+        display: flex;
+        justify-content: center;
+        margin: 28px 0;
+      }
+
+      .orb {
+        width: 96px;
+        height: 96px;
+        border-radius: 50%;
+        background: #3b4063;
+        border: 3px solid #4f5882;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.2s ease;
+        position: relative;
+      }
+
+      .orb:hover {
+        background: #4a5175;
+        transform: scale(1.04);
+      }
+
+      .orb.listening {
+        background: #1d4ed8;
+        border-color: #3b82f6;
+        animation: pulse 1.4s ease-in-out infinite;
+      }
+
+      .orb.processing {
+        background: #7c3aed;
+        border-color: #a78bfa;
+        cursor: default;
+      }
+
+      @keyframes pulse {
+        0%,
+        100% {
+          box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4);
+        }
+        50% {
+          box-shadow: 0 0 0 18px rgba(59, 130, 246, 0);
+        }
+      }
+
+      .orb svg {
+        width: 36px;
+        height: 36px;
+        fill: #e2e8f0;
+      }
+
+      /* ── Status ── */
+      .status {
+        text-align: center;
+        font-size: 0.875rem;
+        color: #94a3b8;
+        margin-bottom: 24px;
+        min-height: 20px;
+      }
+
+      .status.active {
+        color: #60a5fa;
+      }
+      .status.working {
+        color: #a78bfa;
+      }
+      .status.error {
+        color: #f87171;
+      }
+
+      /* ── Transcript + Réponse ── */
+      .conversation {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        margin-top: 8px;
+      }
+
+      .bubble {
+        padding: 12px 16px;
+        border-radius: 12px;
+        font-size: 0.9rem;
+        line-height: 1.5;
+        max-width: 90%;
+        animation: fadeIn 0.25s ease;
+      }
+
+      @keyframes fadeIn {
+        from {
+          opacity: 0;
+          transform: translateY(4px);
+        }
+        to {
+          opacity: 1;
+          transform: none;
+        }
+      }
+
+      .bubble.user {
+        background: #1e3a5f;
+        border: 1px solid #2563eb33;
+        color: #93c5fd;
+        align-self: flex-end;
+        border-bottom-right-radius: 4px;
+      }
+
+      .bubble.bot {
+        background: #1e1b4b;
+        border: 1px solid #7c3aed33;
+        color: #c4b5fd;
+        align-self: flex-start;
+        border-bottom-left-radius: 4px;
+      }
+
+      .bubble.escalate {
+        background: #1f1010;
+        border: 1px solid #dc262633;
+        color: #fca5a5;
+      }
+
+      .label {
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        margin-bottom: 4px;
+        opacity: 0.6;
+      }
+
+      /* ── Session ID ── */
+      .session-info {
+        text-align: center;
+        margin-top: 24px;
+        font-size: 0.7rem;
+        color: #334155;
+      }
+
+      /* ── Bouton reset ── */
+      .btn-reset {
+        display: block;
+        margin: 20px auto 0;
+        background: transparent;
+        border: 1px solid #2d3148;
+        color: #64748b;
+        padding: 8px 20px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 0.8rem;
+        transition: all 0.2s;
+      }
+      .btn-reset:hover {
+        border-color: #4f5882;
+        color: #94a3b8;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="header">
+        <h1>🎙️ Assistant Vocal</h1>
+        <p>Cliquez sur le microphone et parlez</p>
+      </div>
+
+      <div class="orb-wrapper">
+        <div class="orb" id="orb" onclick="toggleRecording()">
+          <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path
+              d="M12 1a4 4 0 0 1 4 4v6a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4zm-1 17.93V21H9v2h6v-2h-2v-2.07A8 8 0 0 0 20 11h-2a6 6 0 0 1-12 0H4a8 8 0 0 0 7 7.93z"
+            />
+          </svg>
+        </div>
+      </div>
+
+      <div class="status" id="status">Prêt — cliquez pour parler</div>
+
+      <div class="conversation" id="conversation"></div>
+
+      <button class="btn-reset" onclick="resetConversation()">
+        Nouvelle session
+      </button>
+
+      <div class="session-info" id="session-info"></div>
+    </div>
+
+    <script>
+      // ── Config ──────────────────────────────────────────────────────────────────
+      const WS_URL = 'ws://localhost:8001/ws/call/';
+      const SAMPLE_RATE = 16000;
+      const FRAME_MS = 32;
+      const FRAME_SIZE = 512;
+
+      // ── État ────────────────────────────────────────────────────────────────────
+      let ws = null;
+      let audioContext = null;
+      let mediaStream = null;
+      let processor = null;
+      let isRecording = false;
+      let sessionId = generateId();
+
+      // ── UI helpers ──────────────────────────────────────────────────────────────
+      const orb = document.getElementById('orb');
+      const statusEl = document.getElementById('status');
+      const conversation = document.getElementById('conversation');
+      const sessionInfo = document.getElementById('session-info');
+
+      sessionInfo.textContent = `Session : ${sessionId}`;
+
+      function setStatus(text, cls = '') {
+        statusEl.textContent = text;
+        statusEl.className = 'status ' + cls;
+      }
+
+      function addBubble(role, text, escalate = false) {
+        const wrap = document.createElement('div');
+        wrap.className = 'bubble ' + role + (escalate ? ' escalate' : '');
+
+        const label = document.createElement('div');
+        label.className = 'label';
+        label.textContent = role === 'user' ? 'Vous' : 'Alex';
+
+        const content = document.createElement('div');
+        content.textContent = text;
+
+        wrap.appendChild(label);
+        wrap.appendChild(content);
+        conversation.appendChild(wrap);
+        wrap.scrollIntoView({ behavior: 'smooth' });
+      }
+
+      function generateId() {
+        return 'sess-' + Math.random().toString(36).slice(2, 10);
+      }
+
+      // ── WebSocket ────────────────────────────────────────────────────────────────
+      function connectWS() {
+        ws = new WebSocket(WS_URL + sessionId);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+          setStatus('Connexion établie — parlez !', 'active');
+        };
+
+        ws.onmessage = async (event) => {
+          if (typeof event.data === 'string') {
+            // Message JSON
+            const msg = JSON.parse(event.data);
+
+            if (msg.type === 'transcript') {
+              addBubble('user', msg.text);
+              setStatus('Traitement en cours...', 'working');
+              orb.className = 'orb processing';
+            }
+
+            if (msg.type === 'response') {
+              addBubble('bot', msg.text, msg.action === 'escalate');
+            }
+          } else {
+            // Bytes → audio WAV
+            await playAudio(event.data);
+            setStatus('En écoute — parlez !', 'active');
+            orb.className = 'orb listening';
+          }
+        };
+
+        ws.onclose = () => {
+          setStatus('Connexion fermée', 'error');
+          orb.className = 'orb';
+          isRecording = false;
+        };
+
+        ws.onerror = (err) => {
+          setStatus(
+            'Erreur WebSocket — vérifiez que le serveur tourne sur :8001',
+            'error',
+          );
+          console.error('WS error:', err);
+        };
+      }
+
+      // ── Lecture audio ────────────────────────────────────────────────────────────
+      async function playAudio(arrayBuffer) {
+        const ctx = new AudioContext();
+        const decoded = await ctx.decodeAudioData(arrayBuffer);
+        const source = ctx.createBufferSource();
+        source.buffer = decoded;
+        source.connect(ctx.destination);
+        source.start();
+        return new Promise((resolve) => {
+          source.onended = resolve;
+        });
+      }
+
+      // ── Enregistrement ───────────────────────────────────────────────────────────
+      async function startRecording() {
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+          });
+          audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+          const source = audioContext.createMediaStreamSource(mediaStream);
+
+          await audioContext.audioWorklet.addModule(getWorkletBlob());
+          processor = new AudioWorkletNode(audioContext, 'pcm-sender');
+
+          processor.port.onmessage = (e) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(e.data); // Int16Array bytes
+            }
+          };
+
+          source.connect(processor);
+          isRecording = true;
+          orb.className = 'orb listening';
+          setStatus('En écoute — parlez !', 'active');
+        } catch (err) {
+          setStatus('Erreur micro : ' + err.message, 'error');
+          console.error(err);
+        }
+      }
+
+      function stopRecording() {
+        if (processor) {
+          processor.disconnect();
+          processor = null;
+        }
+        if (audioContext) {
+          audioContext.close();
+          audioContext = null;
+        }
+        if (mediaStream) {
+          mediaStream.getTracks().forEach((t) => t.stop());
+        }
+        isRecording = false;
+        orb.className = 'orb';
+        setStatus('Prêt — cliquez pour parler');
+      }
+
+      async function toggleRecording() {
+        if (orb.classList.contains('processing')) return;
+
+        if (!isRecording) {
+          connectWS();
+          await startRecording();
+        } else {
+          stopRecording();
+          if (ws) {
+            ws.close();
+            ws = null;
+          }
+        }
+      }
+
+      // ── AudioWorklet inline (évite un fichier externe) ──────────────────────────
+      function getWorkletBlob() {
+        const code = `
+      class PcmSender extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this._buffer = [];
+          this._frameSize = ${FRAME_SIZE};
+        }
+        process(inputs) {
+          const ch = inputs[0][0];
+          if (!ch) return true;
+          for (let i = 0; i < ch.length; i++) {
+            this._buffer.push(Math.max(-1, Math.min(1, ch[i])));
+          }
+          while (this._buffer.length >= this._frameSize) {
+            const frame = this._buffer.splice(0, this._frameSize);
+            const int16 = new Int16Array(frame.map(s => s * 32767));
+            this.port.postMessage(int16.buffer, [int16.buffer]);
+          }
+          return true;
+        }
+      }
+      registerProcessor('pcm-sender', PcmSender);
+    `;
+        const blob = new Blob([code], { type: 'application/javascript' });
+        return URL.createObjectURL(blob);
+      }
+
+      // ── Reset session ────────────────────────────────────────────────────────────
+      function resetConversation() {
+        if (isRecording) stopRecording();
+        if (ws) {
+          ws.close();
+          ws = null;
+        }
+        sessionId = generateId();
+        sessionInfo.textContent = `Session : ${sessionId}`;
+        conversation.innerHTML = '';
+        setStatus('Nouvelle session — cliquez pour parler');
+        orb.className = 'orb';
+      }
+    </script>
+  </body>
+</html>
