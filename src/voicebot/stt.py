@@ -1,94 +1,99 @@
 """
-STT Module — Transcription audio via Faster-Whisper.
-- Modèle préchargé au démarrage (élimine le cold start de ~2s)
-- Filtre durée minimale (élimine les faux déclenchements VAD courts)
+STT Module v2 — Groq Whisper API + fallback Faster-Whisper local.
 """
 
+import io
 import logging
+import os
+import wave
 import numpy as np
-import soundfile as sf
-from faster_whisper import WhisperModel
 
 logger = logging.getLogger(__name__)
 
-# ─── Config ───────────────────────────────────────────────────────────────────
-
 MODEL_SIZE   = "base"
-MIN_DURATION = 0.8   # secondes — segments plus courts = bruit/faux déclenchement
+MIN_DURATION = 0.8
 
-# ─── Singleton ────────────────────────────────────────────────────────────────
+STT_PROVIDER = os.getenv("STT_PROVIDER", "groq").lower()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-_model: WhisperModel | None = None
+_local_model = None
 
 
-def get_model() -> WhisperModel:
-    """Retourne le modèle Whisper (singleton)."""
-    global _model
-    if _model is None:
-        logger.info(f"[STT] Chargement du modèle Whisper '{MODEL_SIZE}'...")
-        _model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
-        logger.info("[STT] Modèle chargé ✅")
-    return _model
+def _get_local_model():
+    global _local_model
+    if _local_model is None:
+        from faster_whisper import WhisperModel
+        logger.info(f"[STT] Chargement Faster-Whisper '{MODEL_SIZE}'...")
+        _local_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+        logger.info("[STT] Faster-Whisper chargé ✅")
+    return _local_model
 
 
 def preload():
-    """
-    Précharge le modèle Whisper au démarrage du serveur.
-    Appeler cette fonction dans le lifespan FastAPI pour éviter
-    le cold start sur la première requête (~2s de délai supplémentaire).
-    """
-    get_model()
+    if STT_PROVIDER == "local":
+        _get_local_model()
+    else:
+        logger.info(f"[STT] Provider={STT_PROVIDER} — pas de préchargement local")
+
+
+def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 16000) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
+def _transcribe_groq(audio_bytes: bytes, sample_rate: int = 16000) -> str:
+    import httpx
+    wav_bytes = _pcm_to_wav(audio_bytes, sample_rate)
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+                data={"model": "whisper-large-v3-turbo", "language": "fr", "response_format": "text"},
+            )
+            response.raise_for_status()
+            text = response.text.strip()
+            logger.info(f"[STT/Groq] '{text}'")
+            return text
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"[STT/Groq] Erreur HTTP {e.response.status_code} → fallback local")
+        return _transcribe_local(audio_bytes, sample_rate)
+    except Exception as e:
+        logger.warning(f"[STT/Groq] Erreur réseau ({e}) → fallback local")
+        return _transcribe_local(audio_bytes, sample_rate)
+
+
+def _transcribe_local(audio_bytes: bytes, sample_rate: int = 16000) -> str:
+    model    = _get_local_model()
+    audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    segments, info = model.transcribe(audio_np, language="fr", beam_size=5,
+                                      vad_filter=False, word_timestamps=False)
+    text = " ".join(seg.text.strip() for seg in segments).strip()
+    logger.info(f"[STT/Local] '{text}' (lang={info.language}, prob={info.language_probability:.2f})")
+    return text
 
 
 def transcribe(audio_bytes: bytes, sample_rate: int = 16000) -> str:
-    """
-    Transcrit un buffer audio PCM int16 en texte français.
-
-    Args:
-        audio_bytes : audio brut PCM 16kHz mono int16 (bytes)
-        sample_rate : fréquence d'échantillonnage
-
-    Returns:
-        Texte transcrit, ou "" si segment trop court / rien détecté.
-    """
-    # ─── Filtre durée minimale ─────────────────────────────────────────────────
-    duration = len(audio_bytes) / (sample_rate * 2)  # 2 bytes par sample int16
+    duration = len(audio_bytes) / (sample_rate * 2)
     if duration < MIN_DURATION:
-        logger.debug(f"[STT] Segment ignoré : {duration:.2f}s < {MIN_DURATION}s (trop court)")
+        logger.debug(f"[STT] Ignoré : {duration:.2f}s < {MIN_DURATION}s")
         return ""
-
-    model = get_model()
-
-    # Convertir bytes → numpy float32 normalisé [-1, 1]
-    audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-
-    segments, info = model.transcribe(
-        audio_np,
-        language="fr",
-        beam_size=5,
-        vad_filter=False,   # VAD géré par Silero en amont
-        word_timestamps=False,
-    )
-
-    text = " ".join(seg.text.strip() for seg in segments).strip()
-
-    if text:
-        logger.info(f"[STT] Transcription ({duration:.2f}s) : '{text}' "
-                    f"(lang={info.language}, prob={info.language_probability:.2f})")
+    logger.info(f"[STT] Transcription {duration:.2f}s via {STT_PROVIDER.upper()}")
+    if STT_PROVIDER == "groq" and GROQ_API_KEY:
+        return _transcribe_groq(audio_bytes, sample_rate)
     else:
-        logger.debug(f"[STT] Aucun texte détecté ({duration:.2f}s)")
-
-    return text
+        if STT_PROVIDER == "groq" and not GROQ_API_KEY:
+            logger.warning("[STT] GROQ_API_KEY manquant → fallback local")
+        return _transcribe_local(audio_bytes, sample_rate)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    import sys
-    if len(sys.argv) > 1:
-        data, sr = sf.read(sys.argv[1], dtype="int16")
-        result = transcribe(data.tobytes(), sr)
-        print(f"Résultat : {result!r}")
-    else:
-        # Test préchargement
-        preload()
-        print("Préchargement OK ✅")
+    preload()
+    print(f"STT v2 prêt (provider={STT_PROVIDER}) ✅")
