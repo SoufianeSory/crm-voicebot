@@ -1,6 +1,6 @@
 # Clés API — NE JAMAIS committer
 .env
-
+.env.template
 # Python
 __pycache__/
 *.pyc
@@ -22,3 +22,8 @@ qdrant_storage/
 
 # Logs
 *.log
+#fichier non desiré dans github
+voicebot_demo_server.py
+demo_concurrent.py
+debug_rag.py
+src/ui/voicebot_demo.html

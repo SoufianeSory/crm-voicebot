@@ -61,7 +61,7 @@
         justify-content: center;
         transition: all 0.2s ease;
       }
-      .orb:hover:not(.processing):not(.speaking) {
+      .orb:hover:not(.speaking) {
         background: #4a5175;
         transform: scale(1.04);
       }
@@ -73,12 +73,10 @@
       .orb.processing {
         background: #7c3aed;
         border-color: #a78bfa;
-        cursor: not-allowed;
       }
       .orb.speaking {
         background: #065f46;
         border-color: #10b981;
-        cursor: not-allowed;
         animation: pulse-green 1.4s ease-in-out infinite;
       }
       @keyframes pulse {
@@ -168,6 +166,12 @@
         border: 1px solid #dc262633;
         color: #fca5a5;
       }
+      .bubble.thinking {
+        background: #1a1a2e;
+        border: 1px solid #4f588233;
+        color: #94a3b8;
+        font-style: italic;
+      }
       .label {
         font-size: 0.7rem;
         font-weight: 600;
@@ -233,7 +237,6 @@
         mediaStream = null,
         processor = null;
       let isRecording = false;
-      let botBusy = false; // TRUE pendant traitement + lecture audio → bloque le VAD
       let sessionId = generateId();
 
       const orb = document.getElementById('orb');
@@ -251,12 +254,13 @@
         return 'sess-' + Math.random().toString(36).slice(2, 10);
       }
 
-      function addBubble(role, text, escalate = false) {
+      function addBubble(role, text, extraClass = '') {
         const wrap = document.createElement('div');
-        wrap.className = 'bubble ' + role + (escalate ? ' escalate' : '');
+        wrap.className =
+          'bubble ' + role + (extraClass ? ' ' + extraClass : '');
         const label = document.createElement('div');
         label.className = 'label';
-        label.textContent = role === 'user' ? 'Vous' : 'Alex';
+        label.textContent = role === 'user' ? 'Vous' : 'Intelcia';
         const content = document.createElement('div');
         content.textContent = text;
         wrap.appendChild(label);
@@ -265,7 +269,7 @@
         wrap.scrollIntoView({ behavior: 'smooth' });
       }
 
-      // ── WebSocket ────────────────────────────────────────────────────────────────
+      // ── WebSocket ──────────────────────────────────────────────────────────────
       function connectWS() {
         ws = new WebSocket(WS_URL + sessionId);
         ws.binaryType = 'arraybuffer';
@@ -278,24 +282,29 @@
 
             if (msg.type === 'transcript') {
               addBubble('user', msg.text);
-              // ── Bloquer le micro dès qu'on reçoit la transcription ──────────
-              botBusy = true;
               orb.className = 'orb processing';
               setStatus('Traitement en cours...', 'working');
             }
 
             if (msg.type === 'response') {
-              addBubble('bot', msg.text, msg.action === 'escalate');
+              if (msg.action === 'thinking') {
+                addBubble('bot', msg.text, 'thinking');
+              } else {
+                addBubble(
+                  'bot',
+                  msg.text,
+                  msg.action === 'escalate' ? 'escalate' : '',
+                );
+              }
             }
           } else {
-            // ── Audio TTS reçu → lecture, micro bloqué pendant ce temps ───────
+            // Audio TTS reçu → lecture
             orb.className = 'orb speaking';
-            setStatus('Alex répond...', 'speaking');
+            setStatus('Intelcia répond...', 'speaking');
 
             await playAudio(event.data);
 
-            // ── Fin de l'audio → micro réactivé ────────────────────────────────
-            botBusy = false;
+            // Fin audio → retour écoute
             orb.className = 'orb listening';
             setStatus('En écoute — parlez !', 'active');
           }
@@ -305,7 +314,6 @@
           setStatus('Connexion fermée', 'error');
           orb.className = 'orb';
           isRecording = false;
-          botBusy = false;
         };
 
         ws.onerror = () => {
@@ -316,20 +324,26 @@
         };
       }
 
-      // ── Lecture audio ────────────────────────────────────────────────────────────
+      // ── Lecture audio ──────────────────────────────────────────────────────────
       async function playAudio(arrayBuffer) {
-        const ctx = new AudioContext();
-        const decoded = await ctx.decodeAudioData(arrayBuffer);
-        const source = ctx.createBufferSource();
-        source.buffer = decoded;
-        source.connect(ctx.destination);
-        source.start();
-        return new Promise((resolve) => {
-          source.onended = resolve;
-        });
+        try {
+          const ctx = new AudioContext();
+          const decoded = await ctx.decodeAudioData(arrayBuffer);
+          const source = ctx.createBufferSource();
+          source.buffer = decoded;
+          source.connect(ctx.destination);
+          source.start();
+          return new Promise((resolve) => {
+            source.onended = resolve;
+          });
+        } catch (err) {
+          console.warn('Audio decode error:', err);
+        }
       }
 
-      // ── Enregistrement ───────────────────────────────────────────────────────────
+      // ── Enregistrement ─────────────────────────────────────────────────────────
+      // Le micro envoie TOUJOURS — c'est le SERVEUR qui décide quoi ignorer
+      // (anti-écho via mute_until). Pas de logique client complexe.
       async function startRecording() {
         try {
           mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -342,8 +356,6 @@
           processor = new AudioWorkletNode(audioContext, 'pcm-sender');
 
           processor.port.onmessage = (e) => {
-            // ── NE PAS envoyer si le bot est en train de traiter/parler ───────
-            if (botBusy) return;
             if (ws && ws.readyState === WebSocket.OPEN) {
               ws.send(e.data);
             }
@@ -375,14 +387,11 @@
           ws = null;
         }
         isRecording = false;
-        botBusy = false;
         orb.className = 'orb';
         setStatus('Prêt — cliquez pour parler');
       }
 
       async function toggleRecording() {
-        if (orb.classList.contains('processing')) return;
-        if (orb.classList.contains('speaking')) return;
         if (!isRecording) {
           connectWS();
           await startRecording();
@@ -391,7 +400,7 @@
         }
       }
 
-      // ── AudioWorklet ─────────────────────────────────────────────────────────────
+      // ── AudioWorklet ───────────────────────────────────────────────────────────
       function getWorkletBlob() {
         const code = `
       class PcmSender extends AudioWorkletProcessor {
@@ -415,7 +424,7 @@
         return URL.createObjectURL(blob);
       }
 
-      // ── Reset ─────────────────────────────────────────────────────────────────────
+      // ── Reset ──────────────────────────────────────────────────────────────────
       function resetConversation() {
         if (isRecording) stopRecording();
         sessionId = generateId();
@@ -423,7 +432,6 @@
         conversation.innerHTML = '';
         setStatus('Nouvelle session — cliquez pour parler');
         orb.className = 'orb';
-        botBusy = false;
       }
     </script>
   </body>

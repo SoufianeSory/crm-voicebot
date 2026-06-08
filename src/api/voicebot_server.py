@@ -1,6 +1,16 @@
 """
-Voicebot Server — FastAPI WebSocket.
-Fix double TTS : queue séquentielle FIFO — jamais 2 réponses simultanées.
+Voicebot Server v5 — Multi-sessions concurrentes, zéro chevauchement.
+
+Architecture :
+    Chaque session WebSocket a son propre worker asyncio.
+    Les questions sont traitées SÉQUENTIELLEMENT dans chaque session (une par une).
+    Les sessions sont INDÉPENDANTES (pas d'interférence entre appels).
+
+Anti-écho :
+    Pendant que le bot parle → les segments audio du client sont filtrés par énergie RMS.
+    Seule une vraie voix forte (barge-in) passe.
+    Après le TTS → mute court pour l'écho résiduel.
+    Le bot ne s'entend JAMAIS et ne s'auto-répond JAMAIS.
 """
 
 import sys, os
@@ -12,6 +22,10 @@ load_dotenv(os.path.join(ROOT, ".env"))
 
 import asyncio
 import logging
+import time
+import re
+import struct
+import math
 from contextlib import asynccontextmanager
 from typing import Dict
 
@@ -21,146 +35,390 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.voicebot.vad import VoiceActivityDetector, FRAME_SAMPLES, get_vad
 from src.voicebot.stt import transcribe, preload as preload_whisper
-from src.voicebot.tts import synthesize
+from src.voicebot.tts import synthesize_stream, synthesize, get_filler_audio, preload_fillers
 from src.graph.workflow import voice_chat
+from config.settings import VOICE_INACTIVITY_SEC, validate_config, MAX_CONCURRENT_SESSIONS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
+# ─── Anti-écho ────────────────────────────────────────────────────────────────
+POST_TTS_MUTE_SEC         = 1.5
+BARGE_IN_ENERGY_THRESHOLD = 0.04
+BARGE_IN_MIN_DURATION_SEC = 0.6
 
+
+def _rms_energy(audio_bytes: bytes) -> float:
+    if len(audio_bytes) < 2:
+        return 0.0
+    n = len(audio_bytes) // 2
+    try:
+        samples = struct.unpack(f'<{n}h', audio_bytes[:n * 2])
+        return math.sqrt(sum(s * s for s in samples) / n) / 32768.0
+    except struct.error:
+        return 0.0
+
+
+def _estimate_audio_duration(audio_bytes: bytes) -> float:
+    return max(1.0, len(audio_bytes) / 6000.0)
+
+
+# ─── Noise filter ─────────────────────────────────────────────────────────────
+_NOISE_RE = re.compile(
+    r'^\.+$|^\s*$|^[\?\!]+$|^hm+$|^euh+$|^ah+$|^oh+$'
+    r'|^sous-titres|^sous titres|^merci d\'avoir regardé'
+    r'|^music$|^\[.*\]$'
+    r'|^you$|^thank you\.?$|^thanks\.?$',
+    re.IGNORECASE
+)
+
+# Hallucinations Whisper fréquentes sur du silence/bruit
+# NOTE: "merci" seul n'est PAS bloqué — le client peut vraiment dire merci.
+# Les hallucinations Whisper de "merci" sont gérées par l'anti-écho (énergie RMS).
+_WHISPER_GHOSTS = {
+    "sous-titres", "sous titres",
+    "merci d'avoir regardé", "merci de votre attention",
+    "...", "..", "!", "?",
+    "you", "thank you", "thanks",
+    "bye bye",
+}
+
+def _is_noise(text: str) -> bool:
+    text = text.strip()
+    if len(text) < 2:
+        return True
+    if _NOISE_RE.match(text):
+        return True
+    if text.lower().rstrip('.!? ') in _WHISPER_GHOSTS:
+        return True
+    # Moins de 1 mot de plus de 1 caractère → bruit
+    if len([w for w in text.split() if len(w) > 1]) < 1:
+        return True
+    return False
+
+
+# ─── Lifespan ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("=== Démarrage voicebot — préchargement des modèles ===")
+    logger.info("=== Démarrage voicebot v5 — multi-sessions ===")
+    validate_config()
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, get_vad)
     await loop.run_in_executor(None, preload_whisper)
-    logger.info("=== Modèles prêts — voicebot opérationnel ✅ ===")
+    await preload_fillers()
+    logger.info(f"=== Voicebot prêt ✅ (max {MAX_CONCURRENT_SESSIONS} sessions) ===")
     yield
 
 
-app = FastAPI(title="Voicebot API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Voicebot API", version="5.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 active_sessions: Dict[str, "SessionState"] = {}
 
 
+# ─── Session State (une par appel, isolée) ────────────────────────────────────
+
 class SessionState:
-    """
-    Queue FIFO + 1 seul worker par session.
-    Garantit que les segments sont traités un par un — jamais en parallèle.
-    """
     def __init__(self, websocket: WebSocket, session_id: str):
-        self.websocket  = websocket
-        self.session_id = session_id
+        self.ws          = websocket
+        self.sid         = session_id
         self.queue: asyncio.Queue[bytes] = asyncio.Queue()
-        self.worker_task = None
+        self.worker_task  = None
+        self.timeout_task = None
 
-    def start_worker(self):
-        self.worker_task = asyncio.create_task(self._worker())
+        # Anti-écho
+        self.is_speaking         = False
+        self.speaking_until      = 0.0
+        self.post_tts_mute_until = 0.0
 
-    async def stop_worker(self):
-        if self.worker_task:
-            self.worker_task.cancel()
-            try:
-                await self.worker_task
-            except asyncio.CancelledError:
-                pass
+        # Tracking
+        self.last_speech   = time.time()
+        self.inactivity_ok = False
+        self.turn_count    = 0
+        self.last_turn     = 0.0
+        self.created       = time.time()
+
+        # Lock pour garantir le traitement séquentiel dans cette session
+        self._processing = False
+
+    def start(self):
+        self.worker_task  = asyncio.create_task(self._worker())
+        self.timeout_task = asyncio.create_task(self._inactivity_watcher())
+
+    async def stop(self):
+        for t in [self.worker_task, self.timeout_task]:
+            if t:
+                t.cancel()
+                try: await t
+                except asyncio.CancelledError: pass
+
+    # ── Anti-écho ─────────────────────────────────────────────────────────────
+
+    def should_accept(self, audio: bytes) -> tuple[bool, str]:
+        now = time.time()
+        dur = len(audio) / (16000 * 2)
+
+        # Pendant TTS → filtre par énergie
+        if self.is_speaking and now < self.speaking_until:
+            energy = _rms_energy(audio)
+            if dur < BARGE_IN_MIN_DURATION_SEC:
+                return False, f"écho court ({dur:.1f}s)"
+            if energy < BARGE_IN_ENERGY_THRESHOLD:
+                return False, f"écho faible ({energy:.3f})"
+            return True, f"barge-in ({energy:.3f})"
+
+        # Juste après TTS → mute résiduel
+        if now < self.post_tts_mute_until:
+            return False, "post-TTS mute"
+
+        return True, "ok"
+
+    def mark_speaking(self, duration: float):
+        self.is_speaking    = True
+        self.speaking_until = time.time() + duration
+
+    def mark_done_speaking(self):
+        self.is_speaking         = False
+        self.speaking_until      = 0.0
+        self.post_tts_mute_until = time.time() + POST_TTS_MUTE_SEC
+
+    def flush_queue(self):
+        n = 0
+        while not self.queue.empty():
+            try: self.queue.get_nowait(); n += 1
+            except asyncio.QueueEmpty: break
+        if n: logger.info(f"[{self.sid}] 🗑️ {n} segments écho vidés")
+
+    # ── Worker : traitement SÉQUENTIEL des segments ───────────────────────────
 
     async def _worker(self):
-        """Consomme les segments un par un — FIFO, jamais concurrent."""
         while True:
-            audio_bytes = await self.queue.get()
             try:
-                await self._process(audio_bytes)
+                first = await self.queue.get()
+                await asyncio.sleep(0.3)  # laisser arriver les segments de la même phrase
+
+                segments = [first]
+                while not self.queue.empty():
+                    try: segments.append(self.queue.get_nowait())
+                    except asyncio.QueueEmpty: break
+
+                if len(segments) > 1:
+                    logger.info(f"[{self.sid}] Fusion {len(segments)} segments")
+
+                self._processing = True
+                await self._process(b"".join(segments))
+                self._processing = False
+
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.error(f"[{self.session_id}] Erreur : {e}", exc_info=True)
-            finally:
-                self.queue.task_done()
+                self._processing = False
+                logger.error(f"[{self.sid}] Erreur worker : {e}", exc_info=True)
+
+    # ── Inactivity ────────────────────────────────────────────────────────────
+
+    async def _inactivity_watcher(self):
+        while True:
+            await asyncio.sleep(5)
+            try:
+                now = time.time()
+                # Déclencher seulement si :
+                # - Le client n'a rien dit depuis VOICE_INACTIVITY_SEC
+                # - Le bot a fini de parler depuis au moins 20s
+                # - On n'est pas en train de traiter ou parler
+                # - On n'a pas déjà envoyé la relance
+                # - Au moins 1 échange a eu lieu
+                time_since_last_turn = now - self.last_turn if self.last_turn > 0 else 0
+                time_since_speech = now - self.last_speech
+
+                if (time_since_speech > VOICE_INACTIVITY_SEC
+                    and time_since_last_turn > 20
+                    and not self.is_speaking and not self._processing
+                    and self.turn_count > 0
+                    and not self.inactivity_ok):
+                    self.inactivity_ok = True
+                    logger.info(f"[{self.sid}] Inactivity ({time_since_speech:.0f}s silence) → relance")
+                    msg = "Vous êtes toujours là ?"
+                    await self.ws.send_json({"type": "response", "text": msg, "action": "respond"})
+                    audio = await synthesize(msg)
+                    if audio:
+                        dur = _estimate_audio_duration(audio)
+                        self.mark_speaking(dur)
+                        await self.ws.send_bytes(audio)
+                        await asyncio.sleep(dur)
+                        self.mark_done_speaking()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                break
+
+    # ── Traitement d'un segment (une question à la fois) ─────────────────────
 
     async def _process(self, audio_bytes: bytes):
-        sid  = self.session_id
-        ws   = self.websocket
         loop = asyncio.get_event_loop()
 
         # 1. STT
-        text = await loop.run_in_executor(None, transcribe, audio_bytes)
-        if not text:
+        try:
+            text = await loop.run_in_executor(None, transcribe, audio_bytes)
+        except Exception as e:
+            logger.error(f"[{self.sid}] STT erreur : {e}")
             return
 
-        logger.info(f"[{sid}] Transcription : '{text}'")
-        try:
-            await ws.send_json({"type": "transcript", "text": text})
-        except Exception:
-            logger.warning(f"[{sid}] WS fermé — abandon")
+        if not text or _is_noise(text):
             return
 
-        # 2. LangGraph
-        result        = await loop.run_in_executor(None, voice_chat, text)
-        response_text = result.get("response", "Je n'ai pas pu traiter votre demande.")
-        action        = result.get("action", "respond")
-
-        logger.info(f"[{sid}] Réponse ({action}) : '{response_text}'")
-        try:
-            await ws.send_json({"type": "response", "text": response_text, "action": action})
-        except Exception:
-            logger.warning(f"[{sid}] WS fermé — abandon")
+        # Vérification post-STT
+        if time.time() < self.post_tts_mute_until:
+            logger.info(f"[{self.sid}] 🔇 '{text}' ignoré (post-TTS)")
             return
 
-        # 3. TTS
-        try:
-            audio_response = await synthesize(response_text)
-            await ws.send_bytes(audio_response)
-            logger.info(f"[{sid}] Audio envoyé ✅ ({len(audio_response)} bytes)")
-        except Exception:
-            logger.warning(f"[{sid}] WS fermé — abandon TTS")
+        self.last_speech   = time.time()
+        self.inactivity_ok = False
 
+        logger.info(f"[{self.sid}] 🗣️ Client : '{text}'")
+        try:
+            await self.ws.send_json({"type": "transcript", "text": text})
+        except Exception:
+            return
+
+        # 2. LLM (avec filler si trop long)
+        try:
+            llm_future = loop.run_in_executor(None, voice_chat, text, self.sid)
+            try:
+                result = await asyncio.wait_for(asyncio.shield(llm_future), timeout=1.5)
+            except asyncio.TimeoutError:
+                # Envoyer filler pendant qu'on attend
+                try:
+                    filler = await get_filler_audio()
+                    if filler:
+                        dur = _estimate_audio_duration(filler)
+                        await self.ws.send_json({"type": "response", "text": "Un instant...", "action": "thinking"})
+                        self.mark_speaking(dur)
+                        await self.ws.send_bytes(filler)
+                        await asyncio.sleep(dur)
+                        self.mark_done_speaking()
+                except Exception:
+                    pass
+                result = await llm_future
+        except Exception as e:
+            logger.error(f"[{self.sid}] LLM erreur : {e}")
+            result = {"response": "Excusez-moi, un souci technique. Je vais vous mettre en relation avec un conseiller humain.", "action": "escalate"}
+
+        response = result.get("response", "Je n'ai pas compris, pouvez-vous répéter ?")
+        action   = result.get("action", "respond")
+
+        logger.info(f"[{self.sid}] 🤖 Intelcia ({action}) : '{response[:80]}'")
+        try:
+            await self.ws.send_json({"type": "response", "text": response, "action": action})
+        except Exception:
+            return
+
+        # 3. TTS — on parle, on bloque l'écho, on flush
+        self.turn_count += 1
+        self.last_turn   = time.time()
+
+        try:
+            chunks = []
+            async for chunk in synthesize_stream(response):
+                chunks.append(chunk)
+
+            if chunks:
+                full = b"".join(chunks)
+                dur  = _estimate_audio_duration(full)
+                self.mark_speaking(dur)
+                await self.ws.send_bytes(full)
+                await asyncio.sleep(dur)
+                self.mark_done_speaking()
+                self.flush_queue()
+                logger.info(f"[{self.sid}] 🔊 Audio envoyé ({len(full)}B, ~{dur:.1f}s)")
+        except Exception as e:
+            logger.warning(f"[{self.sid}] TTS erreur : {e}")
+            self.is_speaking = False
+            self.post_tts_mute_until = time.time() + POST_TTS_MUTE_SEC
+
+    def stats(self) -> dict:
+        return {
+            "session_id": self.sid, "turns": self.turn_count,
+            "speaking": self.is_speaking, "processing": self._processing,
+            "age_sec": round(time.time() - self.created),
+            "idle_sec": round(time.time() - self.last_speech),
+        }
+
+
+# ─── WebSocket endpoint ──────────────────────────────────────────────────────
 
 @app.websocket("/ws/call/{session_id}")
 async def voicebot_ws(websocket: WebSocket, session_id: str):
+    # Vérifier la limite de sessions
+    if len(active_sessions) >= MAX_CONCURRENT_SESSIONS:
+        await websocket.close(code=1013, reason="Trop de sessions actives")
+        logger.warning(f"[{session_id}] Refusé : limite {MAX_CONCURRENT_SESSIONS} atteinte")
+        return
+
     await websocket.accept()
-    logger.info(f"[{session_id}] Session ouverte")
+    logger.info(f"[{session_id}] ══════ Session ouverte ({len(active_sessions)+1} actives) ══════")
 
     state = SessionState(websocket, session_id)
-    state.start_worker()
+    state.start()
     active_sessions[session_id] = state
 
-    vad          = VoiceActivityDetector()
-    frame_buffer = b""
+    vad = VoiceActivityDetector()
+    buf = b""
 
     try:
         while True:
-            data         = await websocket.receive_bytes()
-            frame_buffer += data
+            data = await websocket.receive_bytes()
+            buf += data
 
-            frame_size_bytes = FRAME_SAMPLES * 2
-            while len(frame_buffer) >= frame_size_bytes:
-                frame        = frame_buffer[:frame_size_bytes]
-                frame_buffer = frame_buffer[frame_size_bytes:]
+            frame_bytes = FRAME_SAMPLES * 2
+            while len(buf) >= frame_bytes:
+                frame = buf[:frame_bytes]
+                buf   = buf[frame_bytes:]
 
-                speech_segment = vad.process_frame(frame)
-                if speech_segment:
-                    await state.queue.put(speech_segment)
-                    logger.info(f"[{session_id}] Segment en queue (total={state.queue.qsize()})")
+                segment = vad.process_frame(frame)
+                if not segment:
+                    continue
+
+                ok, reason = state.should_accept(segment)
+                if ok:
+                    if "barge-in" in reason:
+                        logger.info(f"[{session_id}] ⚡ Barge-in détecté")
+                        state.is_speaking = False
+                        state.speaking_until = 0.0
+                        state.flush_queue()
+                    await state.queue.put(segment)
+                else:
+                    logger.debug(f"[{session_id}] 🔇 Ignoré — {reason}")
 
     except WebSocketDisconnect:
         logger.info(f"[{session_id}] Session fermée")
         remaining = vad.flush()
         if remaining:
-            await state.queue.put(remaining)
-            await state.queue.join()
+            ok, _ = state.should_accept(remaining)
+            if ok:
+                await state.queue.put(remaining)
+                await asyncio.sleep(2)
 
     except Exception as e:
         logger.error(f"[{session_id}] Erreur : {e}", exc_info=True)
 
     finally:
-        await state.stop_worker()
+        await state.stop()
         active_sessions.pop(session_id, None)
-        logger.info(f"[{session_id}] Session nettoyée")
+        logger.info(f"[{session_id}] ══════ Session nettoyée ({len(active_sessions)} restantes) ══════")
 
+
+# ─── Health ───────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "active_sessions": len(active_sessions)}
+    return {
+        "status"   : "ok",
+        "version"  : "5.0.0",
+        "sessions" : len(active_sessions),
+        "max"      : MAX_CONCURRENT_SESSIONS,
+        "details"  : [s.stats() for s in active_sessions.values()],
+    }
 
 
 if __name__ == "__main__":
