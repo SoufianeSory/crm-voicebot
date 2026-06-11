@@ -1,16 +1,19 @@
 """
-Voicebot Server v5 — Multi-sessions concurrentes, zéro chevauchement.
+Voicebot Server v5.1 — Multi-sessions + Approche 2 anti-écho.
 
 Architecture :
     Chaque session WebSocket a son propre worker asyncio.
     Les questions sont traitées SÉQUENTIELLEMENT dans chaque session (une par une).
     Les sessions sont INDÉPENDANTES (pas d'interférence entre appels).
 
-Anti-écho :
-    Pendant que le bot parle → les segments audio du client sont filtrés par énergie RMS.
-    Seule une vraie voix forte (barge-in) passe.
-    Après le TTS → mute court pour l'écho résiduel.
-    Le bot ne s'entend JAMAIS et ne s'auto-répond JAMAIS.
+Anti-écho (Approche 2) :
+    Le micro reste OUVERT en permanence.
+    Pendant que le bot parle → filtre énergie RMS pour distinguer écho vs vraie voix.
+    Si le client interrompt (barge-in) :
+        1. Le bot se tait (signal stop_audio au client)
+        2. Ce que le client dit est enregistré dans le contexte
+        3. Le LLM en tient compte dans sa prochaine réponse
+    Post-TTS mute réduit à 0.3s (juste pour l'écho hardware résiduel).
 """
 
 import sys, os
@@ -42,10 +45,10 @@ from config.settings import VOICE_INACTIVITY_SEC, validate_config, MAX_CONCURREN
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
-# ─── Anti-écho ────────────────────────────────────────────────────────────────
-POST_TTS_MUTE_SEC         = 1.5
+# ─── Anti-écho (Approche 2 : micro ouvert + barge-in contextuel) ─────────────
+POST_TTS_MUTE_SEC         = 0.3   # ← APPROCHE 2 : réduit (juste écho hardware)
 BARGE_IN_ENERGY_THRESHOLD = 0.04
-BARGE_IN_MIN_DURATION_SEC = 0.6
+BARGE_IN_MIN_DURATION_SEC = 0.4   # ← APPROCHE 2 : plus réactif aux interruptions
 
 
 def _rms_energy(audio_bytes: bytes) -> float:
@@ -110,7 +113,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Voicebot API", version="5.0.0", lifespan=lifespan)
+app = FastAPI(title="Voicebot API", version="5.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 active_sessions: Dict[str, "SessionState"] = {}
@@ -130,6 +133,11 @@ class SessionState:
         self.is_speaking         = False
         self.speaking_until      = 0.0
         self.post_tts_mute_until = 0.0
+
+        # ← APPROCHE 2 : contexte d'interruption
+        self.last_bot_response   = ""
+        self.was_interrupted     = False
+        self._barge_in_event     = asyncio.Event()
 
         # Tracking
         self.last_speech   = time.time()
@@ -188,6 +196,21 @@ class SessionState:
             try: self.queue.get_nowait(); n += 1
             except asyncio.QueueEmpty: break
         if n: logger.info(f"[{self.sid}] 🗑️ {n} segments écho vidés")
+
+    # ← APPROCHE 2 : gestion centralisée du barge-in
+    async def handle_barge_in(self):
+        """Le client interrompt le bot → on stoppe, on garde le contexte."""
+        self.was_interrupted = True
+        self.is_speaking = False
+        self.speaking_until = 0.0
+        self.post_tts_mute_until = time.time() + POST_TTS_MUTE_SEC
+        self._barge_in_event.set()       # Réveille le sleep TTS
+        self.flush_queue()
+        try:
+            await self.ws.send_json({"type": "stop_audio"})  # Signal au client
+        except Exception:
+            pass
+        logger.info(f"[{self.sid}] ⚡ Barge-in — bot interrompu, micro ouvert")
 
     # ── Worker : traitement SÉQUENTIEL des segments ───────────────────────────
 
@@ -282,8 +305,10 @@ class SessionState:
             return
 
         # 2. LLM (avec filler si trop long)
+        # ← APPROCHE 2 : transmet le contexte d'interruption au LLM
+        interrupted = self.last_bot_response if self.was_interrupted else ""
         try:
-            llm_future = loop.run_in_executor(None, voice_chat, text, self.sid)
+            llm_future = loop.run_in_executor(None, voice_chat, text, self.sid, interrupted)
             try:
                 result = await asyncio.wait_for(asyncio.shield(llm_future), timeout=1.5)
             except asyncio.TimeoutError:
@@ -307,15 +332,17 @@ class SessionState:
         response = result.get("response", "Je n'ai pas compris, pouvez-vous répéter ?")
         action   = result.get("action", "respond")
 
-        logger.info(f"[{self.sid}] 🤖 Intelcia ({action}) : '{response[:80]}'")
+        logger.info(f"[{self.sid}] 🤖 Alex ({action}) : '{response[:80]}'")
         try:
             await self.ws.send_json({"type": "response", "text": response, "action": action})
         except Exception:
             return
 
-        # 3. TTS — on parle, on bloque l'écho, on flush
+        # 3. TTS — approche 2 : sleep interruptible par barge-in
         self.turn_count += 1
         self.last_turn   = time.time()
+        self.last_bot_response = response  # ← APPROCHE 2 : mémorise pour contexte
+        self._barge_in_event.clear()       # ← Reset avant de parler
 
         try:
             chunks = []
@@ -327,9 +354,18 @@ class SessionState:
                 dur  = _estimate_audio_duration(full)
                 self.mark_speaking(dur)
                 await self.ws.send_bytes(full)
-                await asyncio.sleep(dur)
-                self.mark_done_speaking()
-                self.flush_queue()
+
+                # ← APPROCHE 2 : attend fin audio OU barge-in du client
+                try:
+                    await asyncio.wait_for(self._barge_in_event.wait(), timeout=dur)
+                    # Barge-in → handle_barge_in() a déjà tout géré
+                    logger.info(f"[{self.sid}] 🔇 TTS interrompu par barge-in")
+                except asyncio.TimeoutError:
+                    # Fin normale → cleanup standard
+                    self.mark_done_speaking()
+                    self.flush_queue()
+                    self.was_interrupted = False
+
                 logger.info(f"[{self.sid}] 🔊 Audio envoyé ({len(full)}B, ~{dur:.1f}s)")
         except Exception as e:
             logger.warning(f"[{self.sid}] TTS erreur : {e}")
@@ -382,10 +418,7 @@ async def voicebot_ws(websocket: WebSocket, session_id: str):
                 ok, reason = state.should_accept(segment)
                 if ok:
                     if "barge-in" in reason:
-                        logger.info(f"[{session_id}] ⚡ Barge-in détecté")
-                        state.is_speaking = False
-                        state.speaking_until = 0.0
-                        state.flush_queue()
+                        await state.handle_barge_in()  # ← APPROCHE 2
                     await state.queue.put(segment)
                 else:
                     logger.debug(f"[{session_id}] 🔇 Ignoré — {reason}")

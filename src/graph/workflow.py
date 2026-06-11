@@ -1,5 +1,5 @@
 """
-LangGraph Workflow v5.1 — fast_classify en premier, zéro cache, tout par LLM.
+LangGraph Workflow v5.2 — unified : suggestions + barge-in context + hors_sujet flow.
 """
 
 import sys, os
@@ -14,7 +14,7 @@ from langgraph.graph import StateGraph, END
 from src.agents.router_agent     import route_question, fast_classify
 from src.agents.rewriter_agent   import rewrite_question
 from src.agents.rag_agent        import retrieve_with_scores, format_context
-from src.agents.llm_agent        import generate_response, generate_conversational
+from src.agents.llm_agent        import generate_response, generate_conversational, generate_suggestions
 from src.agents.confidence_agent import evaluate_confidence
 from src.agents.session_memory   import (
     add_turn, get_history_text, get_client_name,
@@ -173,6 +173,68 @@ def node_evaluate(state: ChatState) -> ChatState:
     return {**state, "conf_score": r["confidence"], "action": r["action"], "reason": r["reason"]}
 
 
+def _build_suggest_response(alternatives: list, intro: str) -> str:
+    """Formate une réponse avec alternatives + invitation conseiller."""
+    if alternatives:
+        opts = "\n".join(f"• {q}" for q in alternatives)
+        return (
+            f"{intro}\n{opts}\n\n"
+            f"Souhaitez-vous que je réponde à l'une de ces questions ? "
+            f"Ou préférez-vous parler à un conseiller ?"
+        )
+    return (
+        "Je n'ai pas de réponse précise pour cette demande. "
+        "Pourriez-vous reformuler votre question ? "
+        "Ou souhaitez-vous parler à un conseiller ?"
+    )
+
+
+def node_suggest_alternatives(state: ChatState) -> ChatState:
+    """
+    Confiance trop basse après fallback RAG (chat uniquement).
+    Propose des questions alternatives basées sur le contexte récupéré.
+    """
+    alternatives = generate_suggestions(state["question"], state.get("context", ""))
+    response = _build_suggest_response(
+        alternatives,
+        "Je n'ai pas trouvé de réponse précise à votre demande. Peut-être cherchez-vous à savoir :"
+    )
+    sid = state.get("session_id", "default")
+    try:
+        add_turn(sid, state["question"], response, state.get("intent", "faq"), "suggest")
+        mark_first_turn_done(sid)
+    except Exception:
+        pass
+    return {**state, "response": response, "action": "suggest", "reason": "alternatives — confiance basse"}
+
+
+def node_suggest_hors_sujet(state: ChatState) -> ChatState:
+    """
+    Question hors-sujet en mode chat : fait un RAG rapide pour trouver
+    des sujets voisins et les propose plutôt qu'escalader directement.
+    """
+    question = state["question"]
+    try:
+        docs, _ = retrieve_with_scores(question=question, intent="faq", fast_mode=True)
+        context = format_context(docs)
+    except Exception:
+        context = ""
+
+    alternatives = generate_suggestions(question, context) if context else []
+    response = _build_suggest_response(
+        alternatives,
+        "Cette question est hors de mon domaine du service client. Peut-être cherchez-vous à savoir :"
+    )
+    sid = state.get("session_id", "default")
+    try:
+        add_turn(sid, question, response, "hors_sujet", "suggest")
+        mark_first_turn_done(sid)
+    except Exception:
+        pass
+    return {**state, "response": response, "action": "suggest", "reason": "hors_sujet → alternatives",
+            "context": context, "intent": "hors_sujet"}
+
+
 def node_respond(state: ChatState) -> ChatState:
     sid = state.get("session_id", "default")
     try:
@@ -217,44 +279,57 @@ def node_escalate(state: ChatState) -> ChatState:
 
 # ─── Edges ────────────────────────────────────────────────────────────────────
 
-def route_after_router(state: ChatState) -> Literal["rag", "conversational", "escalate"]:
-    if state["intent"] in ("hors_sujet", "escalade"):  return "escalate"
-    if state["intent"] == "conversationnel": return "conversational"
+def route_after_router(state: ChatState) -> Literal["rag", "conversational", "escalate", "suggest_hors_sujet"]:
+    intent = state["intent"]
+    mode   = state.get("mode", "chat")
+    if intent == "escalade":   return "escalate"
+    if intent == "hors_sujet":
+        # Voice → escalade directe ; Chat → propose des alternatives d'abord
+        return "escalate" if mode == "voice" else "suggest_hors_sujet"
+    if intent == "conversationnel": return "conversational"
     return "rag"
 
-def decide_action(state: ChatState) -> Literal["respond", "fallback", "escalate"]:
+def decide_action(state: ChatState) -> Literal["respond", "fallback", "escalate", "suggest"]:
     if state["action"] == "respond":    return "respond"
-    if state.get("mode") == "voice":    return "escalate"
+    if state.get("mode") == "voice":    return "escalate"   # voice : escalade directe
     if not state.get("retry", False):   return "fallback"
-    return "escalate"
+    return "suggest"                                        # chat : alternatives avant escalade
 
 
 # ─── Graphe compilé UNE SEULE FOIS ───────────────────────────────────────────
 
 def _build():
     g = StateGraph(ChatState)
-    g.add_node("rewrite_route",  node_rewrite_and_route)
-    g.add_node("conversational", node_conversational)
-    g.add_node("rag",            node_rag)
-    g.add_node("rag_fallback",   node_rag_fallback)
-    g.add_node("llm",            node_llm)
-    g.add_node("evaluate",       node_evaluate)
-    g.add_node("respond",        node_respond)
-    g.add_node("escalate",       node_escalate)
+    g.add_node("rewrite_route",       node_rewrite_and_route)
+    g.add_node("conversational",      node_conversational)
+    g.add_node("rag",                 node_rag)
+    g.add_node("rag_fallback",        node_rag_fallback)
+    g.add_node("llm",                 node_llm)
+    g.add_node("evaluate",            node_evaluate)
+    g.add_node("respond",             node_respond)
+    g.add_node("escalate",            node_escalate)
+    g.add_node("suggest_alternatives", node_suggest_alternatives)  # confiance basse (faq/troubleshoot)
+    g.add_node("suggest_hors_sujet",   node_suggest_hors_sujet)    # question hors-sujet (chat)
 
     g.set_entry_point("rewrite_route")
     g.add_conditional_edges("rewrite_route", route_after_router, {
-        "rag": "rag", "conversational": "conversational", "escalate": "escalate",
+        "rag": "rag", "conversational": "conversational",
+        "escalate": "escalate", "suggest_hors_sujet": "suggest_hors_sujet",
     })
-    g.add_edge("conversational", END)
-    g.add_edge("rag", "llm")
-    g.add_edge("llm", "evaluate")
+    g.add_edge("conversational",      END)
+    g.add_edge("suggest_hors_sujet",  END)
+    g.add_edge("rag",                 "llm")
+    g.add_edge("llm",                 "evaluate")
     g.add_conditional_edges("evaluate", decide_action, {
-        "respond": "respond", "fallback": "rag_fallback", "escalate": "escalate",
+        "respond":  "respond",
+        "fallback": "rag_fallback",
+        "escalate": "escalate",
+        "suggest":  "suggest_alternatives",
     })
-    g.add_edge("rag_fallback", "llm")
-    g.add_edge("respond", END)
-    g.add_edge("escalate", END)
+    g.add_edge("rag_fallback",        "llm")
+    g.add_edge("respond",             END)
+    g.add_edge("escalate",            END)
+    g.add_edge("suggest_alternatives", END)
     return g.compile()
 
 _app = _build()
@@ -266,12 +341,17 @@ logger.info("[Workflow] Graphe compilé ✅")
 def chat(question: str, session_id: str = "default") -> dict:
     return _run(question, mode="chat", session_id=session_id)
 
-def voice_chat(question: str, session_id: str = "default") -> dict:
-    return _run(question, mode="voice", session_id=session_id)
+def voice_chat(question: str, session_id: str = "default", interrupted_response: str = "") -> dict:
+    """interrupted_response : ce que le bot disait quand le client l'a interrompu (barge-in)."""
+    return _run(question, mode="voice", session_id=session_id, interrupted_response=interrupted_response)
 
-def _run(question: str, mode: str = "chat", session_id: str = "default") -> dict:
+def _run(question: str, mode: str = "chat", session_id: str = "default", interrupted_response: str = "") -> dict:
     history     = get_history_text(session_id, max_turns=3)
     client_name = get_client_name(session_id) or ""
+
+    # Contexte de barge-in : le LLM sait ce qu'il disait quand il a été interrompu
+    if interrupted_response:
+        history += f"\n[Le client t'a interrompu pendant que tu disais : \"{interrupted_response[:150]}\"]\n"
 
     initial: ChatState = {
         "question": question, "rewritten": "", "intent": "", "context": "",

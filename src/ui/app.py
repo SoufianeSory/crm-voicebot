@@ -51,6 +51,16 @@ st.markdown("""
     max-width: 75%;
     border-left: 4px solid #cc0000;
 }
+.suggest-bubble {
+    background-color: #fffbea;
+    color: #333;
+    padding: 10px 16px;
+    border-radius: 18px 18px 18px 4px;
+    margin: 6px 0;
+    max-width: 88%;
+    border-left: 4px solid #f59e0b;
+    white-space: pre-line;
+}
 .meta-info {
     font-size: 11px;
     color: #999;
@@ -73,6 +83,9 @@ if "messages" not in st.session_state:
 if "show_meta" not in st.session_state:
     st.session_state.show_meta = False
 
+if "pending_question" not in st.session_state:
+    st.session_state.pending_question = None  # Question soumise via bouton
+
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 
 with st.sidebar:
@@ -94,10 +107,13 @@ with st.sidebar:
     nb_user  = sum(1 for m in st.session_state.messages if m["role"] == "user")
     nb_auto  = sum(1 for m in st.session_state.messages if m.get("action") == "respond")
     nb_escal = sum(1 for m in st.session_state.messages if m.get("action") == "escalate")
+    nb_sug   = sum(1 for m in st.session_state.messages if m.get("action") == "suggest")
 
     col1, col2 = st.columns(2)
     col1.metric("Questions", nb_user)
     col2.metric("Réponses auto", nb_auto)
+    if nb_sug > 0:
+        st.metric("Suggestions", nb_sug)
     if nb_escal > 0:
         st.metric("Escalades", nb_escal, delta=f"-{nb_escal}", delta_color="inverse")
 
@@ -109,6 +125,11 @@ with st.sidebar:
 
 # ─── Affichage historique ─────────────────────────────────────────────────────
 
+def _parse_alternatives(content: str) -> list:
+    """Extrait les lignes '• ...' du message suggest."""
+    return [l.lstrip("• ").strip() for l in content.split("\n") if l.strip().startswith("•")]
+
+
 for msg in st.session_state.messages:
     if msg["role"] == "user":
         st.markdown(f'<div class="user-bubble">👤 {msg["content"]}</div>', unsafe_allow_html=True)
@@ -117,6 +138,8 @@ for msg in st.session_state.messages:
         action = msg.get("action", "respond")
         if action == "escalate":
             st.markdown(f'<div class="escalade-bubble">🔴 {msg["content"]}</div>', unsafe_allow_html=True)
+        elif action == "suggest":
+            st.markdown(f'<div class="suggest-bubble">💡 {msg["content"]}</div>', unsafe_allow_html=True)
         else:
             st.markdown(f'<div class="bot-bubble">🤖 {msg["content"]}</div>', unsafe_allow_html=True)
 
@@ -136,9 +159,31 @@ for msg in st.session_state.messages:
                 unsafe_allow_html=True
             )
 
+# ─── Boutons de choix (seulement pour le dernier message suggest) ─────────────
+
+if st.session_state.messages:
+    last = st.session_state.messages[-1]
+    if last["role"] == "assistant" and last.get("action") == "suggest":
+        alternatives = _parse_alternatives(last["content"])
+        if alternatives:
+            st.markdown("**Choisissez une option :**")
+            for j, alt in enumerate(alternatives):
+                if st.button(f"📋  {alt}", key=f"btn_alt_{j}", use_container_width=True):
+                    st.session_state.pending_question = alt
+                    st.rerun()
+        st.markdown("")
+        if st.button("👤  Parler à un conseiller", key="btn_escalate", use_container_width=True):
+            st.session_state.pending_question = "Je souhaite parler à un conseiller humain"
+            st.rerun()
+
 # ─── Input utilisateur ────────────────────────────────────────────────────────
 
 question = st.chat_input("Posez votre question...")
+
+# Un bouton a été cliqué → traiter la question correspondante
+if not question and st.session_state.pending_question:
+    question = st.session_state.pending_question
+    st.session_state.pending_question = None
 
 if question:
     st.session_state.messages.append({"role": "user", "content": question})

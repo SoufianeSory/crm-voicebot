@@ -238,6 +238,8 @@
         processor = null;
       let isRecording = false;
       let sessionId = generateId();
+      let currentAudioSource = null; // ← APPROCHE 2 : pour stopper l'audio en cours
+      let currentAudioCtx = null;
 
       const orb = document.getElementById('orb');
       const statusEl = document.getElementById('status');
@@ -260,7 +262,7 @@
           'bubble ' + role + (extraClass ? ' ' + extraClass : '');
         const label = document.createElement('div');
         label.className = 'label';
-        label.textContent = role === 'user' ? 'Vous' : 'Intelcia';
+        label.textContent = role === 'user' ? 'Vous' : 'Alex';
         const content = document.createElement('div');
         content.textContent = text;
         wrap.appendChild(label);
@@ -279,6 +281,25 @@
         ws.onmessage = async (event) => {
           if (typeof event.data === 'string') {
             const msg = JSON.parse(event.data);
+
+            // ← APPROCHE 2 : le serveur demande de stopper l'audio (barge-in)
+            if (msg.type === 'stop_audio') {
+              if (currentAudioSource) {
+                try {
+                  currentAudioSource.stop();
+                } catch (e) {}
+                currentAudioSource = null;
+              }
+              if (currentAudioCtx) {
+                try {
+                  currentAudioCtx.close();
+                } catch (e) {}
+                currentAudioCtx = null;
+              }
+              orb.className = 'orb listening';
+              setStatus('En écoute — parlez !', 'active');
+              return;
+            }
 
             if (msg.type === 'transcript') {
               addBubble('user', msg.text);
@@ -300,7 +321,7 @@
           } else {
             // Audio TTS reçu → lecture
             orb.className = 'orb speaking';
-            setStatus('Intelcia répond...', 'speaking');
+            setStatus('Alex répond...', 'speaking');
 
             await playAudio(event.data);
 
@@ -324,20 +345,28 @@
         };
       }
 
-      // ── Lecture audio ──────────────────────────────────────────────────────────
+      // ── Lecture audio (APPROCHE 2 : source trackée pour stop sur barge-in) ──
       async function playAudio(arrayBuffer) {
         try {
           const ctx = new AudioContext();
+          currentAudioCtx = ctx;
           const decoded = await ctx.decodeAudioData(arrayBuffer);
           const source = ctx.createBufferSource();
           source.buffer = decoded;
           source.connect(ctx.destination);
+          currentAudioSource = source;
           source.start();
           return new Promise((resolve) => {
-            source.onended = resolve;
+            source.onended = () => {
+              currentAudioSource = null;
+              currentAudioCtx = null;
+              resolve();
+            };
           });
         } catch (err) {
           console.warn('Audio decode error:', err);
+          currentAudioSource = null;
+          currentAudioCtx = null;
         }
       }
 
